@@ -434,6 +434,21 @@ struct omni_context {
     bool say_speaking = false;  // forced speech has started and not ended
     int say_tokens_per_chunk = 4;  // ~1 s of speech: the TTS makes at most ~1 s per unit
 
+    // Context notes (omni_context_note): text the duplex model should know,
+    // written into its context between units while it is not speaking, as
+    // context_template with {text} replaced. An announce note then has the
+    // model speak (in its own words) once nobody is talking.
+    struct context_note {
+        std::string              text;
+        std::vector<llama_token> tokens;
+        bool                     announce = false;
+    };
+    std::mutex context_mtx;
+    std::deque<context_note> context_notes;
+    std::string context_template = "<|im_start|>system\n{text}<|im_end|>\n";
+    bool context_announce_due = false;  // LLM thread: a note to announce was written
+    std::string context_event;          // LLM thread: event for the next decode's output
+
     // Tool router (omni_router_configure). Every user utterance (a run of
     // voiced units) is decided by the same LLM in text mode: transcribed on
     // sequence 2, then a tool is chosen for the transcript with the configured
@@ -446,8 +461,9 @@ struct omni_context {
     // which then replaces the transcription. Needs OMNI_ROUTER_CTX.
     struct router_config {
         std::string              system;             // tools prompt (system turn)
-        std::string              user_template;      // user turn: {heard} transcript, {recent} model's recent speech
+        std::string              user_template;      // user turn: {heard} transcript, {recent} model's recent speech, {context} recent context notes
         std::string              transcribe_prompt;  // instruction after the audio when transcribing
+        std::string              context_empty = "(none)";  // {context} when no note was written
         std::vector<std::string> tools;              // tool names to choose from
         std::vector<float>       bias;               // logit bias per tool (same order)
         std::vector<std::string> reasoning;          // lines started in <think>, each completed by the model
@@ -486,6 +502,7 @@ struct omni_context {
     bool router_gate_next   = true;   // the next speech onset is checked
     int  router_prefix_len  = 0;      // system prompt cached on sequence 1
     std::string router_recent;        // what the model said lately
+    std::string router_context;       // the latest context notes written (one per line)
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
@@ -561,6 +578,15 @@ void omni_say(struct omni_context * ctx_omni, const std::string & text);
 // Drops forced speech not spoken yet (audio already generated still arrives;
 // a forced turn already started still ends properly).
 void omni_say_cancel(struct omni_context * ctx_omni);
+
+// Context note in a duplex session: `text` is written into the model's context
+// (not spoken) before the next unit where the model is not speaking, wrapped in
+// ctx_omni->context_template ({text}; special tokens in `text` are not parsed).
+// The model uses it as it likes; with `announce` it also starts speaking as
+// soon as nobody is talking (what it says is its own). Calls queue up.
+void omni_context_note(struct omni_context * ctx_omni, const std::string & text, bool announce);
+// Drops context notes not written yet.
+void omni_context_clear(struct omni_context * ctx_omni);
 
 // Tool router: enables it with `config` (see omni_context::router_config), or
 // disables it when config.tools is empty. Call between sessions.

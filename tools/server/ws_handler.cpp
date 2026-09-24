@@ -195,6 +195,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->force_listen_used = 0;
     omni_say_cancel(octx);
     octx->say_speaking = false;
+    omni_context_clear(octx);
 
     octx->tts_all_generated_tokens.clear();
     octx->tts_token_buffer.clear();
@@ -237,6 +238,7 @@ static void apply_session_config(common_params & params, omni_context * octx, co
     // Session-scoped settings: a reused context must not keep the previous
     // session's (tool router, forced speech rate).
     octx->say_tokens_per_chunk = 4;
+    octx->context_template = "<|im_start|>system\n{text}<|im_end|>\n";
     {
         omni_context::router_config rc;
         if (init.config.is_object() && init.config.contains("router") && init.config.at("router").is_object()) {
@@ -251,6 +253,7 @@ static void apply_session_config(common_params & params, omni_context * octx, co
                 rc.silence_hold       = r.value("silence_hold", rc.silence_hold);
                 rc.tool_hold          = r.value("tool_hold", rc.tool_hold);
                 rc.client_transcripts = r.value("client_transcripts", rc.client_transcripts);
+                rc.context_empty      = r.value("context_empty", rc.context_empty);
                 if (r.contains("reasoning") && r.at("reasoning").is_array()) {
                     for (const auto & t : r.at("reasoning")) {
                         if (t.is_string()) rc.reasoning.push_back(t.get<std::string>());
@@ -291,6 +294,9 @@ static void apply_session_config(common_params & params, omni_context * octx, co
     }
     if (init.config.contains("max_new_speak_tokens_per_chunk") && init.config.at("max_new_speak_tokens_per_chunk").is_number_integer()) {
         octx->max_new_speak_tokens_per_chunk = init.config.at("max_new_speak_tokens_per_chunk").get<int>();
+    }
+    if (init.config.contains("context_template") && init.config.at("context_template").is_string()) {
+        octx->context_template = init.config.at("context_template").get<std::string>();
     }
     if (init.config.contains("say_tokens_per_chunk") && init.config.at("say_tokens_per_chunk").is_number_integer()) {
         octx->say_tokens_per_chunk = init.config.at("say_tokens_per_chunk").get<int>();
@@ -1240,6 +1246,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             if (!parsed_input.say.empty()) {
                 omni_say(octx, parsed_input.say);
             }
+            // Context notes are written before a later unit the model is not speaking in.
+            if (!parsed_input.context.empty()) {
+                omni_context_note(octx, parsed_input.context, parsed_input.announce);
+            }
 
             // Write audio to temp WAV
             if (!parsed_input.audio_b64.empty()) {
@@ -1331,6 +1341,15 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                  elapsed_ms(t_request_start), 0,
                                                  turn_vision_slices)));
                         break; // Done for this input
+                    } else if (frag.rfind("__CONTEXT__", 0) == 0) {
+                        // Context notes written: {"notes", "tokens", "announce"}
+                        json ev = json::parse(frag.substr(11), nullptr, false);
+                        if (ev.is_object()) {
+                            ev["type"] = "response.context";
+                            ev["session_id"] = session_id;
+                            ev["response_id"] = response_id;
+                            ws.send(ev.dump());
+                        }
                     } else if (frag.rfind("__ROUTER__", 0) == 0) {
                         // Tool router decision: {"name", "call", "heard"[, "interrupted"]}
                         json ev;

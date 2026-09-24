@@ -80,6 +80,10 @@ docker compose up -d                    # ws://127.0.0.1:19060/backend
 - `config.say_tokens_per_chunk` — forced speech rate (default 4 tokens per
   unit, about 1 s of speech; the TTS makes at most ~1 s of audio per unit).
 - `config.router` — the tool router (below).
+- `config.context_template` — how context notes are written (below; default
+  `<|im_start|>system
+{text}<|im_end|>
+`).
 
 ## input.append (full duplex)
 
@@ -90,6 +94,20 @@ docker compose up -d                    # ws://127.0.0.1:19060/backend
 - `voiced` — the client's VAD: whether this unit has speech (otherwise RMS).
 - `transcript` — the client ends an utterance with this unit and says what it
   was; the router uses it instead of transcribing.
+- `context` — a context note: text for the model to know (e.g. a background
+  task's result), written into its context, not spoken, before the next unit
+  where it is not speaking. Answered back with
+  `{"type": "response.context", "notes": 1, "tokens": 33, "announce": false}`
+  when written. The model uses it when it answers.
+- `announce: true` (with `context`) — the model also starts speaking about it,
+  in its own words, as soon as nobody is talking (with the router: not during
+  an utterance nor its own speech).
+
+Context notes work for facts: given "明天上海小雨，18–22 度" the model tells it
+and answers follow-ups from it. It does not hold back on what a note says is
+not known yet ("still looking it up"): asked, it makes up an answer. Keep
+progress out of notes and answer progress questions from the client (route
+them to a backend tool and `say` the task's state).
 
 ## Tool router
 
@@ -111,6 +129,10 @@ tools prompt (sequence 1, system prompt cached):
   "client_transcripts": true
 }
 ```
+
+`{context}` in `user_template` is replaced by the latest context notes (one per
+line, ~480 bytes) or by `context_empty` (default `(none)`) before any; with it
+the tools prompt can send questions the notes answer to `reply`.
 
 The tool name is chosen greedily among the configured names (with the logit
 bias); arguments are generated for other tools. With `client_transcripts`, an

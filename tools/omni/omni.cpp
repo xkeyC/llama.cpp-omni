@@ -4074,8 +4074,11 @@ void omni_router_configure(struct omni_context * ctx_omni, const omni_context::r
     ctx_omni->router_turn_open   = false;
     ctx_omni->router_open_mouth  = false;
     ctx_omni->router_gate_next   = true;
+    ctx_omni->context_announce_due = false;
+    ctx_omni->context_event.clear();
     ctx_omni->router_prefix_len  = 0;  // the tools prompt may have changed
     ctx_omni->router_recent.clear();
+    ctx_omni->router_context.clear();
     if (capable) {
         llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
         llama_memory_seq_rm(mem, 1, 0, -1);
@@ -4159,21 +4162,24 @@ static void router_remember_audio(omni_context * ctx_omni, const std::vector<flo
     }
 }
 
+// Appends `text` to `tail`, keeping its last `max_bytes` (whole UTF-8 characters).
+static void router_keep_tail(std::string & tail, const std::string & text, size_t max_bytes) {
+    tail += text;
+    if (tail.size() > max_bytes) {
+        size_t cut = tail.size() - max_bytes;
+        while (cut < tail.size() && (static_cast<unsigned char>(tail[cut]) & 0xC0) == 0x80) {
+            cut++;  // do not split a UTF-8 character
+        }
+        tail.erase(0, cut);
+    }
+}
+
 // Keeps the tail of what the model said, for the router's context.
 static void router_remember_speech(omni_context * ctx_omni, const std::string & text) {
     if (!ctx_omni->router_enabled || text.empty()) {
         return;
     }
-    std::string & recent = ctx_omni->router_recent;
-    recent += text;
-    const size_t max_bytes = 240;
-    if (recent.size() > max_bytes) {
-        size_t cut = recent.size() - max_bytes;
-        while (cut < recent.size() && (static_cast<unsigned char>(recent[cut]) & 0xC0) == 0x80) {
-            cut++;  // do not split a UTF-8 character
-        }
-        recent.erase(0, cut);
-    }
+    router_keep_tail(ctx_omni->router_recent, text, 240);
 }
 
 // Decodes tokens or embeddings on sequence `seq` from position pos0; logits
@@ -4389,7 +4395,10 @@ static int router_decide(omni_context * ctx_omni, common_params * params, std::s
         pos = ctx_omni->router_prefix_len;
         std::string user = cfg.user_template.empty() ? "{heard}" : cfg.user_template;
         for (const auto & [key, value] : {std::pair<std::string, std::string>{"{heard}", heard},
-                                          std::pair<std::string, std::string>{"{recent}", ctx_omni->router_recent}}) {
+                                          std::pair<std::string, std::string>{"{recent}", ctx_omni->router_recent},
+                                          std::pair<std::string, std::string>{"{context}", ctx_omni->router_context.empty()
+                                                                                  ? cfg.context_empty
+                                                                                  : ctx_omni->router_context}}) {
             const size_t at = user.find(key);
             if (at != std::string::npos) user.replace(at, key.size(), value);
         }
@@ -4500,6 +4509,36 @@ void omni_say_cancel(struct omni_context * ctx_omni) {
     }
     std::lock_guard<std::mutex> lk(ctx_omni->say_mtx);
     ctx_omni->say_tokens.clear();  // a turn already started still gets its end
+}
+
+void omni_context_note(struct omni_context * ctx_omni, const std::string & text, bool announce) {
+    if (!ctx_omni || !ctx_omni->ctx_llama || text.empty()) {
+        return;
+    }
+    // The template's own markup is special; the text is not.
+    const std::string & tpl  = ctx_omni->context_template;
+    const size_t        at   = tpl.find("{text}");
+    const std::string   pre  = at == std::string::npos ? tpl : tpl.substr(0, at);
+    const std::string   post = at == std::string::npos ? std::string() : tpl.substr(at + 6);
+    omni_context::context_note note;
+    note.text     = text;
+    note.announce = announce;
+    for (const auto & [part, special] : {std::pair<std::string, bool>{pre, true}, {text, false}, {post, true}}) {
+        if (!part.empty()) {
+            const auto t = common_tokenize(ctx_omni->ctx_llama, part, /*add_special*/ false, special);
+            note.tokens.insert(note.tokens.end(), t.begin(), t.end());
+        }
+    }
+    std::lock_guard<std::mutex> lk(ctx_omni->context_mtx);
+    ctx_omni->context_notes.push_back(std::move(note));
+}
+
+void omni_context_clear(struct omni_context * ctx_omni) {
+    if (!ctx_omni) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(ctx_omni->context_mtx);
+    ctx_omni->context_notes.clear();
 }
 
 bool omni_set_voice_bundle(struct omni_context * ctx_omni, const std::string & bundle_dir) {
@@ -10423,6 +10462,57 @@ static bool duplex_do_forced_speech(omni_context * ctx_omni, common_params * par
     return true;
 }
 
+// Context notes (omni_context_note) go in between units while the model is
+// not speaking (text inside its own speech would garble it). They are not
+// accepted by the sampler: the repetition penalty would keep the model from
+// saying what they tell it.
+static void duplex_write_context(omni_context * ctx_omni, common_params * params) {
+    if (!ctx_omni->slide_last_was_listen.load() || ctx_omni->say_speaking) {
+        return;
+    }
+    std::deque<omni_context::context_note> notes;
+    {
+        std::lock_guard<std::mutex> lk(ctx_omni->context_mtx);
+        notes.swap(ctx_omni->context_notes);
+    }
+    if (notes.empty()) {
+        return;
+    }
+    const auto t_begin  = std::chrono::high_resolution_clock::now();
+    const int  n_past_0 = ctx_omni->n_past;
+    const bool sw       = ctx_omni->sliding_window_config.mode != "off";
+    if (sw) {
+        sliding_window_register_unit_start(ctx_omni);
+    }
+    bool announce = false;
+    int  written  = 0;
+    for (const auto & note : notes) {
+        if (!eval_tokens(ctx_omni, params, note.tokens, params->n_batch, &ctx_omni->n_past)) {
+            LOG_ERR("duplex context note: eval failed\n");
+            break;
+        }
+        announce = announce || note.announce;
+        written++;
+        if (ctx_omni->router_enabled) {
+            // The router knows the notes too: a question they answer is for the model.
+            router_keep_tail(ctx_omni->router_context, note.text + "\n", 480);
+        }
+    }
+    if (sw) {
+        sliding_window_register_unit_end(ctx_omni, "context", {}, true);
+    }
+    if (announce) {
+        ctx_omni->context_announce_due = true;
+    }
+    ctx_omni->context_event = "{\"notes\": " + std::to_string(written) + ", \"tokens\": "
+                            + std::to_string(ctx_omni->n_past - n_past_0) + ", \"announce\": "
+                            + (announce ? "true" : "false") + "}";
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t_begin).count();
+    print_with_timestamp("[prof] llm context notes=%d n_past=%d->%d announce=%d ms=%.1f\n",
+                         written, n_past_0, ctx_omni->n_past, (int) announce, ms);
+}
+
 // ---------------------------------------------------------------------------
 // llm thread 的辅助：执行一轮 duplex decode。
 // 语义与老 stream_decode 的 duplex 分支（L9398-L9817 + 尾部 response unit 注册 + 
@@ -10463,6 +10553,10 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         ctx_omni->text_queue.clear();
         ctx_omni->text_done_flag  = false;
         ctx_omni->text_streaming  = true;
+        if (!ctx_omni->context_event.empty()) {
+            ctx_omni->text_queue.push_back("__CONTEXT__" + ctx_omni->context_event);
+            ctx_omni->context_event.clear();
+        }
     }
 
     if (ctx_omni->use_tts) {
@@ -10525,6 +10619,13 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         }
     }
 
+    if (!ctx_omni->router_enabled && ctx_omni->context_announce_due) {
+        ctx_omni->context_announce_due = false;
+        if (ctx_omni->slide_last_was_listen.load()) {
+            ctx_omni->router_open_mouth = true;  // announce: speak now
+        }
+    }
+
     // ---- tool router ----
     // Listening is decided by masking the next sample to <|listen|> (the
     // usual listen bookkeeping then runs, including ending a TTS turn).
@@ -10566,7 +10667,15 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             }
         }
         if (!decided) {
-            if (ctx_omni->router_hold > 0) {
+            if (ctx_omni->context_announce_due && !speaking && !ctx_omni->router_in_utt) {
+                // A context note to announce: the model speaks now, in its own words.
+                ctx_omni->context_announce_due = false;
+                ctx_omni->router_hold          = 0;
+                ctx_omni->router_answer_due    = false;
+                ctx_omni->router_gate_next     = false;
+                ctx_omni->router_answering     = true;
+                ctx_omni->router_open_mouth    = true;
+            } else if (ctx_omni->router_hold > 0) {
                 ctx_omni->router_hold--;
                 listen = true;
             } else if (ctx_omni->router_gate_next && !speaking) {
@@ -10927,6 +11036,7 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
+                duplex_write_context(ctx_omni, params);
                 // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
                 if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
                     duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);

@@ -379,6 +379,8 @@ ParsedInput parse_input_append(const json & msg) {
     out.force_listen = json_bool(in, "force_listen", false);
     out.say = json_str(in, "say");
     out.say_cancel = json_bool(in, "say_cancel", false);
+    out.context = json_str(in, "context");
+    out.announce = json_bool(in, "announce", false);
     if (in.contains("transcript") && in.at("transcript").is_string()) {
         out.has_transcript = true;
         out.transcript = in.at("transcript").get<std::string>();
