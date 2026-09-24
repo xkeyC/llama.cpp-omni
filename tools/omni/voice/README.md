@@ -60,6 +60,9 @@ docker compose up -d                    # ws://127.0.0.1:19060/backend
   in another container reaches it without any port mapping by joining the
   compose network: `ws://omni:19060/backend`.
 - Build arguments take `HTTP_PROXY` / `HTTPS_PROXY` from the environment.
+- A server with a slow network can take an image built elsewhere
+  (`CUDA_DOCKER_ARCH` covering its GPU): `docker save llama-omni-server:cuda`,
+  copy, `docker load`, then `docker compose up -d` uses it without building.
 
 ## session.init
 
