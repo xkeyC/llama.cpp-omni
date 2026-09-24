@@ -471,6 +471,8 @@ struct omni_context {
     long router_units       = 0;      // units seen
     long router_utt_start   = 0;      // unit the current / last utterance started at
     long router_speech_start = -1;    // unit the model's current speech started at
+    bool router_answering   = false;  // the model spoke since the last decision to speak
+    bool router_open_mouth  = false;  // the next sample may not listen or end: answer now
     bool router_gate_next   = true;   // the next speech onset is checked
     int  router_prefix_len  = 0;      // system prompt cached on sequence 1
     std::string router_recent;        // what the model said lately

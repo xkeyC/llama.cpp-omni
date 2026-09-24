@@ -1340,6 +1340,18 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
                 logits[ctx_omni->special_token_listen] += listen_bias;
             }
             
+            // Tool router: "reply" decided, so the model answers now instead
+            // of (having learned from being held back) keeping quiet.
+            if (ctx_omni->router_open_mouth) {
+                ctx_omni->router_open_mouth = false;
+                for (llama_token t : {ctx_omni->special_token_listen, ctx_omni->special_token_chunk_eos,
+                                      ctx_omni->special_token_turn_eos}) {
+                    if (t >= 0) {
+                        logits[t] = -INFINITY;
+                    }
+                }
+            }
+
             // 2. 🔧 [与 Python 对齐] 禁止采样 <|tts_pad|> token
             // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
             //         logits[:, self.forbidden_token_ids] = float("-inf")
@@ -4035,6 +4047,8 @@ void omni_router_configure(struct omni_context * ctx_omni, const omni_context::r
     ctx_omni->router_units       = 0;
     ctx_omni->router_utt_start   = 0;
     ctx_omni->router_speech_start = -1;
+    ctx_omni->router_answering   = false;
+    ctx_omni->router_open_mouth  = false;
     ctx_omni->router_gate_next   = true;
     ctx_omni->router_prefix_len  = 0;  // the tools prompt may have changed
     ctx_omni->router_recent.clear();
@@ -10391,6 +10405,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             if (listen && speaking && !router_event.empty()) {
                 router_event.pop_back();
                 router_event += ", \"interrupted\": true}";
+            } else if (!listen && !speaking) {
+                // Answer it, starting now.
+                ctx_omni->router_open_mouth   = true;
+                ctx_omni->router_gate_next    = false;
+                ctx_omni->router_speech_start = ctx_omni->router_units;
+                ctx_omni->router_answering    = true;
             }
         } else if (ctx_omni->router_gate_next) {
             // Would the model start speaking? (greedy: listen vs the rest,
@@ -10411,6 +10431,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                 if (!listen) {
                     ctx_omni->router_gate_next    = false;
                     ctx_omni->router_speech_start = ctx_omni->router_units;
+                    ctx_omni->router_answering    = true;
                 }
             }
         }
@@ -10613,6 +10634,14 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     // The next speech onset (after listening or a finished turn) is gated.
     if (ctx_omni->ended_with_listen || local_is_end_of_turn) {
         ctx_omni->router_gate_next = true;
+    }
+    // Having answered and yielded the floor, the model waits for the next
+    // utterance: left alone in a silent room it keeps greeting and repeats
+    // itself. (Going on right after its turn ends, without listening, is
+    // still the same answer.)
+    if (ctx_omni->router_answering && ctx_omni->ended_with_listen) {
+        ctx_omni->router_answering = false;
+        ctx_omni->router_utt_speak = false;
     }
 
     // ---- 推送轮次结束标记 ----
