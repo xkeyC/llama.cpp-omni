@@ -458,7 +458,7 @@ struct omni_context {
         bool                     client_transcripts = false;  // utterances end with client transcripts only
     };
     router_config router;
-    bool router_enabled = false;
+    std::atomic<bool> router_enabled{false};
     std::deque<std::vector<float>> router_utt_audio;  // audio of the current / last utterance
     // Per prefilled unit, in order (server thread -> LLM thread, which takes
     // one per audio packet: prefills and decodes are not always paired).
@@ -480,7 +480,6 @@ struct omni_context {
     int  router_hold        = 0;      // units still kept listening
     long router_units       = 0;      // units seen
     long router_utt_start   = 0;      // unit the current / last utterance started at
-    long router_speech_start = -1;    // unit the model's current speech started at
     bool router_answering   = false;  // the model spoke since the last decision to speak
     bool router_turn_open   = false;  // the model's own speech is going on (no turn end yet)
     bool router_open_mouth  = false;  // the next sample may not listen or end: answer now

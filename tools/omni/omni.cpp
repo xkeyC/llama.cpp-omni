@@ -4045,7 +4045,8 @@ void omni_router_configure(struct omni_context * ctx_omni, const omni_context::r
     if (ctx_omni->router_enabled) {
         // Sequences 1 and 2 must stay within the cells beyond n_ctx, or
         // sequence 0 runs out of room before its window slides.
-        const size_t prompt = common_tokenize(ctx_omni->ctx_llama, config.system, false, true).size();
+        const size_t prompt = common_tokenize(
+            ctx_omni->ctx_llama, "<|im_start|>system\n" + config.system + "<|im_end|>\n", false, true).size();
         const int    budget = (int) llama_n_ctx(ctx_omni->ctx_llama) - ctx_omni->params->n_ctx;
         if ((int) prompt + 1024 > budget) {
             LOG_ERR("%s: tools prompt of %zu tokens does not fit OMNI_ROUTER_CTX=%d (needs ~%zu); router disabled\n",
@@ -4069,7 +4070,6 @@ void omni_router_configure(struct omni_context * ctx_omni, const omni_context::r
     ctx_omni->router_hold        = 0;
     ctx_omni->router_units       = 0;
     ctx_omni->router_utt_start   = 0;
-    ctx_omni->router_speech_start = -1;
     ctx_omni->router_answering   = false;
     ctx_omni->router_turn_open   = false;
     ctx_omni->router_open_mouth  = false;
@@ -4282,7 +4282,6 @@ static int router_decide(omni_context * ctx_omni, common_params * params, std::s
 
     ctx_omni->router_utt_decided = true;
     ctx_omni->router_need_route  = false;
-    ctx_omni->router_answer_due  = false;
 
     std::vector<float> audio;
     for (const auto & unit : ctx_omni->router_utt_audio) {
@@ -4475,7 +4474,8 @@ static int router_decide(omni_context * ctx_omni, common_params * params, std::s
     print_with_timestamp("[prof] router: %s audio=%ds ms=%.1f%s%s\n", event.c_str(), n_audio / 10, ms,
                          thoughts.empty() ? "" : " think: ", thoughts.c_str());
 
-    ctx_omni->router_utt_speak = (name == "reply");
+    ctx_omni->router_answer_due = false;  // this decision replaces an earlier one
+    ctx_omni->router_utt_speak  = (name == "reply");
     if (name == "silence") {
         ctx_omni->router_hold = std::max(0, cfg.silence_hold);
     } else if (name != "reply") {
@@ -10381,7 +10381,6 @@ static bool duplex_do_forced_speech(omni_context * ctx_omni, common_params * par
     ctx_omni->ended_with_listen     = false;
     ctx_omni->slide_last_was_listen = false;
     router_remember_speech(ctx_omni, text);
-    ctx_omni->router_speech_start = 0;  // ours: no later decision stops it
     if (last) {
         ctx_omni->router_gate_next = true;
     }
@@ -10548,15 +10547,19 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                     router_event += ", \"interrupted\": true}";
                 } else if (!listen) {
                     ctx_omni->router_hold = 0;
-                    if (!speaking && ctx_omni->router_in_utt) {
+                    if (speaking) {
+                        // It goes on talking (likely into this already); the
+                        // decision holds for when it yields, instead of being
+                        // reset with the answer it was giving.
+                        ctx_omni->router_answering = false;
+                    } else if (ctx_omni->router_in_utt) {
                         // The speaker went on: answer once they stop.
                         ctx_omni->router_answer_due = true;
                         listen = true;
-                    } else if (!speaking) {
+                    } else {
                         // Answer it, starting now.
                         ctx_omni->router_open_mouth   = true;
                         ctx_omni->router_gate_next    = false;
-                        ctx_omni->router_speech_start = ctx_omni->router_units;
                         ctx_omni->router_answering    = true;
                     }
                 }
@@ -10587,7 +10590,6 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                     if (wants || ctx_omni->router_answer_due) {
                         ctx_omni->router_answer_due   = false;
                         ctx_omni->router_gate_next    = false;
-                        ctx_omni->router_speech_start = ctx_omni->router_units;
                         ctx_omni->router_answering    = true;
                         // Sampling must not listen after all.
                         ctx_omni->router_open_mouth   = true;

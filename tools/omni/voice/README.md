@@ -93,7 +93,8 @@ Every `session.init` configures the router anew (none without `config.router`). 
  "heard": "...", "interrupted": true}
 ```
 
-- `reply`: the model answers, starting in that unit;
+- `reply`: the model answers: in that unit, or when the speaker stops if
+  they went on talking (a model already speaking just goes on);
 - `silence`: the model keeps listening (and stops if it was speaking);
 - any other tool: reported to the client, the model keeps listening; the
   client typically runs the task and sends the result as `say`.
