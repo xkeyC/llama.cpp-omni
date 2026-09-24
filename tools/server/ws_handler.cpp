@@ -1216,20 +1216,21 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             double prefill_ms = 0.0;
             int turn_vision_slices = parsed_input.video_frames_b64.empty() ? 0 : 1;
 
-            // Tool router: whether this unit has speech. The LLM thread reads
-            // it while taking this unit's prefill, before the next input.
+            // Tool router: what this unit is, for the LLM thread when it
+            // takes this unit's audio.
             if (octx->router_enabled) {
-                octx->router_unit_ends = parsed_input.has_transcript;
-                octx->router_unit_transcript = parsed_input.transcript;
+                omni_context::router_unit unit;
+                unit.ends       = parsed_input.has_transcript;
+                unit.transcript = parsed_input.transcript;
                 if (parsed_input.voiced >= 0) {
-                    octx->router_unit_voiced = parsed_input.voiced == 1;
+                    unit.voiced = parsed_input.voiced == 1;
                 } else {
                     const auto pcm = b64_to_float32_pcm(parsed_input.audio_b64);
                     double sum = 0.0;
                     for (const float v : pcm) sum += (double) v * v;
-                    octx->router_unit_voiced =
-                        !pcm.empty() && std::sqrt(sum / pcm.size()) > octx->router.voice_rms;
+                    unit.voiced = !pcm.empty() && std::sqrt(sum / pcm.size()) > octx->router.voice_rms;
                 }
+                omni_router_unit(octx, unit);
             }
 
             // Forced speech takes effect from this unit's decode on.
@@ -1338,7 +1339,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         ev["response_id"] = response_id;
                         ev["arguments"] = json::object();
                         try {
-                            const json decision = json::parse(frag.substr(10));
+                            json decision = json::parse(frag.substr(10), nullptr, false);
+                            if (decision.is_discarded() || !decision.is_object()) {
+                                throw std::runtime_error("unparsable: " + frag.substr(10, 200));
+                            }
                             ev["name"] = decision.value("name", std::string());
                             ev["heard"] = decision.value("heard", std::string());
                             if (decision.value("interrupted", false)) {
@@ -1346,6 +1350,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                             }
                             // The generated call may be cut short: parse what is there.
                             const std::string call = decision.value("call", std::string());
+                            bool parsed_call = false;
                             for (const std::string & tail : {std::string(), std::string("}"), std::string("}}"),
                                                              std::string("\"}}")}) {
                                 const json parsed = json::parse(call + tail, nullptr, false);
@@ -1353,11 +1358,12 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                     if (parsed.is_object() && parsed.contains("arguments")) {
                                         ev["arguments"] = parsed.at("arguments");
                                     }
+                                    parsed_call = true;
                                     break;
                                 }
                             }
-                            if (ev["arguments"].empty() && call.find("\"arguments\"") != std::string::npos) {
-                                ev["raw"] = call;
+                            if (!parsed_call) {
+                                ev["raw"] = call;  // arguments could not be recovered
                             }
                         } catch (const std::exception & e) {
                             LOG_WRN("WS /backend: bad router event: %s\n", e.what());

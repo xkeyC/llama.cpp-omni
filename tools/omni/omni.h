@@ -423,7 +423,8 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
-    std::string token2wav_voice;      // prompt bundle dir in use; empty = prompt_cache.gguf
+    std::string token2wav_voice;      // prompt bundle dir in use; empty = the default voice
+    std::string token2wav_default_bundle;  // the default voice's bundle dir when started from one
 
     // Forced speech (omni_say): text tokens the duplex decode speaks verbatim,
     // say_tokens_per_chunk per 1 s unit, in place of sampling (the TTS makes
@@ -459,9 +460,17 @@ struct omni_context {
     router_config router;
     bool router_enabled = false;
     std::deque<std::vector<float>> router_utt_audio;  // audio of the current / last utterance
-    bool router_unit_voiced = false;  // the unit being prefilled has speech (set by the server)
-    bool router_unit_ends   = false;  // the client ends an utterance with this unit ...
-    std::string router_unit_transcript;  // ... and says what it was (see input.append.transcript)
+    // Per prefilled unit, in order (server thread -> LLM thread, which takes
+    // one per audio packet: prefills and decodes are not always paired).
+    struct router_unit {
+        bool        voiced = false;  // has speech
+        bool        ends   = false;  // the client ends an utterance here ...
+        std::string transcript;      // ... and says what it was
+    };
+    std::mutex router_units_mtx;
+    std::deque<router_unit> router_unit_queue;
+    bool router_close_mouth = false;  // the next sample must be <|listen|>
+    bool router_answer_due  = false;  // "reply" decided while the speaker went on: answer after
     bool router_has_transcript = false;  // router_transcript holds the utterance to decide
     std::string router_transcript;
     bool router_in_utt      = false;  // inside a voiced run
@@ -557,6 +566,8 @@ void omni_say_cancel(struct omni_context * ctx_omni);
 // Tool router: enables it with `config` (see omni_context::router_config), or
 // disables it when config.tools is empty. Call between sessions.
 void omni_router_configure(struct omni_context * ctx_omni, const omni_context::router_config & config);
+// Tool router: what the client says about the unit about to be prefilled.
+void omni_router_unit(struct omni_context * ctx_omni, const omni_context::router_unit & unit);
 
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",

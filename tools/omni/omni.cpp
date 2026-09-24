@@ -1342,6 +1342,14 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             
             // Tool router: "reply" decided, so the model answers now instead
             // of (having learned from being held back) keeping quiet.
+            if (ctx_omni->router_close_mouth && ctx_omni->special_token_listen >= 0) {
+                // Tool router: listen this unit, whatever the model would say.
+                ctx_omni->router_close_mouth = false;
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)));
+                const float keep = logits[ctx_omni->special_token_listen];
+                std::fill(logits, logits + n_vocab, -INFINITY);
+                logits[ctx_omni->special_token_listen] = std::isfinite(keep) ? keep : 0.0f;
+            }
             if (ctx_omni->router_open_mouth) {
                 ctx_omni->router_open_mouth = false;
                 for (llama_token t : {ctx_omni->special_token_listen, ctx_omni->special_token_chunk_eos,
@@ -4034,14 +4042,29 @@ void omni_router_configure(struct omni_context * ctx_omni, const omni_context::r
     }
     ctx_omni->router         = config;
     ctx_omni->router_enabled = capable && !config.tools.empty();
+    if (ctx_omni->router_enabled) {
+        // Sequences 1 and 2 must stay within the cells beyond n_ctx, or
+        // sequence 0 runs out of room before its window slides.
+        const size_t prompt = common_tokenize(ctx_omni->ctx_llama, config.system, false, true).size();
+        const int    budget = (int) llama_n_ctx(ctx_omni->ctx_llama) - ctx_omni->params->n_ctx;
+        if ((int) prompt + 1024 > budget) {
+            LOG_ERR("%s: tools prompt of %zu tokens does not fit OMNI_ROUTER_CTX=%d (needs ~%zu); router disabled\n",
+                    __func__, prompt, budget, prompt + 1024);
+            ctx_omni->router_enabled = false;
+        }
+    }
     ctx_omni->router.bias.resize(config.tools.size(), 0.0f);
     ctx_omni->router_utt_audio.clear();
-    ctx_omni->router_unit_voiced = false;
+    {
+        std::lock_guard<std::mutex> lk(ctx_omni->router_units_mtx);
+        ctx_omni->router_unit_queue.clear();
+    }
+    ctx_omni->router_close_mouth = false;
+    ctx_omni->router_answer_due  = false;
     ctx_omni->router_in_utt      = false;
     ctx_omni->router_utt_decided = true;
     ctx_omni->router_utt_speak   = false;
     ctx_omni->router_need_route  = false;
-    ctx_omni->router_unit_ends   = false;
     ctx_omni->router_has_transcript = false;
     ctx_omni->router_hold        = 0;
     ctx_omni->router_units       = 0;
@@ -4061,28 +4084,48 @@ void omni_router_configure(struct omni_context * ctx_omni, const omni_context::r
 }
 
 // Tracks utterances (runs of voiced units) and keeps the current one's audio.
-static void router_remember_audio(omni_context * ctx_omni, const std::vector<float> & audio_embed) {
-    if (!ctx_omni->router_enabled || audio_embed.empty()) {
+void omni_router_unit(struct omni_context * ctx_omni, const omni_context::router_unit & unit) {
+    if (!ctx_omni || !ctx_omni->router_enabled) {
         return;
+    }
+    std::lock_guard<std::mutex> lk(ctx_omni->router_units_mtx);
+    ctx_omni->router_unit_queue.push_back(unit);
+}
+
+static void router_remember_audio(omni_context * ctx_omni, const std::vector<float> & audio_embed) {
+    if (!ctx_omni->router_enabled) {
+        return;
+    }
+    omni_context::router_unit unit;
+    {
+        std::lock_guard<std::mutex> lk(ctx_omni->router_units_mtx);
+        if (!ctx_omni->router_unit_queue.empty()) {
+            unit = std::move(ctx_omni->router_unit_queue.front());
+            ctx_omni->router_unit_queue.pop_front();
+        }
     }
     ctx_omni->router_units++;
     // An utterance that ended but was not decided yet (forced speech runs
     // first) is kept, and what comes meanwhile is decided with it.
     const bool pending = ctx_omni->router_need_route;
-    if (ctx_omni->router_unit_ends) {
-        // The client ended an utterance here and transcribed it itself.
-        ctx_omni->router_unit_ends   = false;
+    if (unit.ends) {
+        // The client ended an utterance here and transcribed it itself. With
+        // client transcripts the client joins pieces of one utterance, so a
+        // newer transcript replaces a pending one.
         ctx_omni->router_in_utt      = false;
         ctx_omni->router_utt_decided = false;
         ctx_omni->router_need_route  = true;
-        ctx_omni->router_transcript  = pending && ctx_omni->router_has_transcript
-            ? ctx_omni->router_transcript + " " + ctx_omni->router_unit_transcript
-            : ctx_omni->router_unit_transcript;
+        ctx_omni->router_transcript  = pending && ctx_omni->router_has_transcript && !ctx_omni->router.client_transcripts
+            ? ctx_omni->router_transcript + " " + unit.transcript
+            : unit.transcript;
         ctx_omni->router_has_transcript = true;
         ctx_omni->router_utt_audio.clear();
         return;
     }
-    if (ctx_omni->router_unit_voiced) {
+    if (audio_embed.empty()) {
+        return;
+    }
+    if (unit.voiced) {
         if (!ctx_omni->router_in_utt) {
             ctx_omni->router_in_utt      = true;
             ctx_omni->router_utt_decided = false;
@@ -4165,13 +4208,31 @@ static bool router_decode(omni_context * ctx_omni, llama_seq_id seq, const llama
 
 // Whole, valid UTF-8 only: token pieces cut at a limit can end mid-character.
 static std::string router_utf8_clean(const std::string & s) {
+    // RFC 3629: no overlong forms, no surrogates, nothing above U+10FFFF.
     std::string out;
-    for (size_t i = 0; i < s.size();) {
-        const unsigned char b = static_cast<unsigned char>(s[i]);
-        const size_t len = b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 0;
-        bool whole = len > 0 && i + len <= s.size();
+    const auto * p = reinterpret_cast<const unsigned char *>(s.data());
+    const size_t n = s.size();
+    for (size_t i = 0; i < n;) {
+        const unsigned char b = p[i];
+        size_t len = 0;
+        unsigned char lo = 0x80, hi = 0xBF;  // allowed range of the second byte
+        if (b < 0x80) {
+            len = 1;
+        } else if (b >= 0xC2 && b <= 0xDF) {
+            len = 2;
+        } else if (b >= 0xE0 && b <= 0xEF) {
+            len = 3;
+            if (b == 0xE0) lo = 0xA0;
+            if (b == 0xED) hi = 0x9F;
+        } else if (b >= 0xF0 && b <= 0xF4) {
+            len = 4;
+            if (b == 0xF0) lo = 0x90;
+            if (b == 0xF4) hi = 0x8F;
+        }
+        bool whole = len > 0 && i + len <= n;
         for (size_t k = 1; whole && k < len; k++) {
-            whole = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+            const unsigned char cb = p[i + k];
+            whole = k == 1 ? (cb >= lo && cb <= hi) : (cb & 0xC0) == 0x80;
         }
         if (whole) {
             out.append(s, i, len);
@@ -4206,9 +4267,10 @@ static std::string router_json_escape(const std::string & s) {
 }
 
 // Decides the current utterance: transcribes it (sequence 2), then picks a
-// tool for the transcript (sequence 1). Returns whether the model may speak,
-// and fills `event` with {"name", "arguments", "heard"} for the client.
-static bool router_decide(omni_context * ctx_omni, common_params * params, std::string & event) {
+// tool for the transcript (sequence 1). Returns 1 if the model may speak, 0
+// if not, -1 for no decision (nothing was said: noise, a cough); fills
+// `event` with {"name", "call", "heard"} for the client.
+static int router_decide(omni_context * ctx_omni, common_params * params, std::string & event) {
     const auto t0 = std::chrono::high_resolution_clock::now();
     llama_context *     ctx     = ctx_omni->ctx_llama;
     const llama_vocab * vocab   = llama_model_get_vocab(llama_get_model(ctx));
@@ -4220,6 +4282,7 @@ static bool router_decide(omni_context * ctx_omni, common_params * params, std::
 
     ctx_omni->router_utt_decided = true;
     ctx_omni->router_need_route  = false;
+    ctx_omni->router_answer_due  = false;
 
     std::vector<float> audio;
     for (const auto & unit : ctx_omni->router_utt_audio) {
@@ -4281,14 +4344,29 @@ static bool router_decide(omni_context * ctx_omni, common_params * params, std::
         }
         heard = greedy(64, false);
         llama_memory_seq_rm(mem, 2, 0, -1);
-        while (!heard.empty() && isspace(static_cast<unsigned char>(heard.back()))) heard.pop_back();
+    }
+    // Only what is still going on is kept for the next decision (the audio
+    // decided now must not be decided again).
+    if (ctx_omni->router_in_utt) {
+        const long keep = ctx_omni->router_units - ctx_omni->router_utt_start + 1;
+        while ((long) ctx_omni->router_utt_audio.size() > keep) ctx_omni->router_utt_audio.pop_front();
+    } else {
+        ctx_omni->router_utt_audio.clear();
+    }
+    heard = router_utf8_clean(heard.substr(0, 600));
+    while (!heard.empty() && isspace(static_cast<unsigned char>(heard.back()))) heard.pop_back();
+    if (!ok || heard.empty()) {
+        // Nothing was said (or it could not be heard): no decision.
+        memcpy(llama_get_logits_ith(ctx, -1), saved.data(), n_vocab * sizeof(float));
+        event.clear();
+        return -1;
     }
 
     // 2. Which tool.
     std::string name = "silence";
     std::string rest = "\", \"arguments\": {}}";
     std::string thoughts;
-    if (ok && !heard.empty()) {
+    {
         seq = 1;
         if (ctx_omni->router_prefix_len == 0) {
             llama_memory_seq_rm(mem, 1, 0, -1);
@@ -4302,7 +4380,7 @@ static bool router_decide(omni_context * ctx_omni, common_params * params, std::
                 ctx_omni->router_enabled = false;
                 memcpy(llama_get_logits_ith(ctx, -1), saved.data(), n_vocab * sizeof(float));
                 event.clear();
-                return true;
+                return -1;
             }
             ok = router_decode(ctx_omni, seq, prefix.data(), nullptr, (int) prefix.size(), 0, n_batch);
             ctx_omni->router_prefix_len = ok ? (int) prefix.size() : 0;
@@ -4378,20 +4456,20 @@ static bool router_decide(omni_context * ctx_omni, common_params * params, std::
         }
         llama_memory_seq_rm(mem, 1, ctx_omni->router_prefix_len, -1);
     }
+    memcpy(llama_get_logits_ith(ctx, -1), saved.data(), n_vocab * sizeof(float));
     if (!ok) {
         ctx_omni->router_prefix_len = 0;
         llama_memory_seq_rm(mem, 1, 0, -1);
         llama_memory_seq_rm(mem, 2, 0, -1);
-        name = "reply";
-        rest = "\", \"arguments\": {}}";
+        event.clear();
+        return -1;
     }
-    memcpy(llama_get_logits_ith(ctx, -1), saved.data(), n_vocab * sizeof(float));
 
     // {"name": ..., "call": <the generated tool call, raw>, "heard": ...};
     // the server parses the call (it may be cut short).
     event = "{\"name\": \"" + router_json_escape(name) + "\", \"call\": \"" +
             router_json_escape(router_utf8_clean("{\"name\": \"" + name + rest)) + "\", \"heard\": \"" +
-            router_json_escape(router_utf8_clean(heard)) + "\"}";
+            router_json_escape(heard) + "\"}";
 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
     print_with_timestamp("[prof] router: %s audio=%ds ms=%.1f%s%s\n", event.c_str(), n_audio / 10, ms,
@@ -4403,7 +4481,7 @@ static bool router_decide(omni_context * ctx_omni, common_params * params, std::
     } else if (name != "reply") {
         ctx_omni->router_hold = std::max(0, cfg.tool_hold);
     }
-    return ctx_omni->router_utt_speak;
+    return ctx_omni->router_utt_speak ? 1 : 0;
 }
 
 void omni_say(struct omni_context * ctx_omni, const std::string & text) {
@@ -4431,29 +4509,29 @@ bool omni_set_voice_bundle(struct omni_context * ctx_omni, const std::string & b
     if (bundle_dir == ctx_omni->token2wav_voice) {
         return true;
     }
-    const std::string default_cache = ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
-    if (bundle_dir.empty() && !std::ifstream(default_cache).good()) {
-        // Started from a prompt bundle (no prompt_cache.gguf): nothing to restore.
-        LOG_WRN("%s: no %s to restore the default voice; keeping '%s'\n", __func__, default_cache.c_str(),
-                ctx_omni->token2wav_voice.c_str());
-        return true;
-    }
-    // Same n_timesteps / temperature as omni_init uses.
-    const bool ok = bundle_dir.empty()
-        ? ctx_omni->token2wav_session->set_prompt_cache_gguf(
-              ctx_omni->token2wav_model_dir + "/prompt_cache.gguf", 5, 1.0f)
-        : ctx_omni->token2wav_session->set_prompt_bundle(bundle_dir, 5, 1.0f);
+    // The default voice is what token2wav was started with: prompt_cache.gguf,
+    // or the prompt bundle it fell back to. Same n_timesteps / temperature as
+    // omni_init uses.
+    auto set_default = [&]() {
+        return ctx_omni->token2wav_default_bundle.empty()
+            ? ctx_omni->token2wav_session->set_prompt_cache_gguf(
+                  ctx_omni->token2wav_model_dir + "/prompt_cache.gguf", 5, 1.0f)
+            : ctx_omni->token2wav_session->set_prompt_bundle(ctx_omni->token2wav_default_bundle, 5, 1.0f);
+    };
+    const bool ok = bundle_dir.empty() ? set_default()
+                                       : ctx_omni->token2wav_session->set_prompt_bundle(bundle_dir, 5, 1.0f);
     if (!ok) {
-        LOG_ERR("%s: failed to switch token2wav voice to '%s'" "\n", __func__, bundle_dir.c_str());
+        LOG_ERR("%s: failed to switch token2wav voice to '%s'\n", __func__, bundle_dir.c_str());
         // The previous prompt was already reset; fall back to the default voice.
-        ctx_omni->token2wav_session->set_prompt_cache_gguf(
-            ctx_omni->token2wav_model_dir + "/prompt_cache.gguf", 5, 1.0f);
+        if (!set_default()) {
+            LOG_ERR("%s: the default voice could not be restored either\n", __func__);
+        }
         ctx_omni->token2wav_voice.clear();
         return false;
     }
     ctx_omni->token2wav_voice = bundle_dir;
     ctx_omni->token2wav_buffer = {4218, 4218, 4218};
-    print_with_timestamp("Token2Wav: voice set to %s" "\n", bundle_dir.empty() ? "default" : bundle_dir.c_str());
+    print_with_timestamp("Token2Wav: voice set to %s\n", bundle_dir.empty() ? "default" : bundle_dir.c_str());
     return true;
 }
 
@@ -4871,6 +4949,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
                         vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                if (init_ok) {
+                    ctx_omni->token2wav_default_bundle = prompt_bundle_dir;  // restored as the default voice
+                }
             }
             // Fallback to CPU
             if (!init_ok) {
@@ -10446,97 +10527,77 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     }
 
     // ---- tool router ----
+    // Listening is decided by masking the next sample to <|listen|> (the
+    // usual listen bookkeeping then runs, including ending a TTS turn).
     if (ctx_omni->router_enabled) {
         std::string router_event;
-        bool        listen = false;
-        // The model's own speech (not forced speech) is going on.
-        const bool speaking = ctx_omni->router_turn_open && ctx_omni->router_speech_start != 0;
+        bool        listen   = false;
+        bool        decided  = false;
+        const bool  speaking = ctx_omni->router_turn_open;  // the model's own speech
         if (ctx_omni->router_need_route) {
             // An utterance ended: decide it, whatever the model is doing and
             // even during a hold. The model keeps talking into what it hears
             // next, so a decision against speaking also stops its own speech;
             // the client decides what to do with the audio already made.
-            listen = !router_decide(ctx_omni, params, router_event);
-            if (listen && speaking && !router_event.empty()) {
-                router_event.pop_back();
-                router_event += ", \"interrupted\": true}";
-            } else if (!listen) {
-                ctx_omni->router_hold = 0;
-                if (!speaking && ctx_omni->router_enabled) {
-                    // Answer it, starting now.
-                    ctx_omni->router_open_mouth   = true;
-                    ctx_omni->router_gate_next    = false;
-                    ctx_omni->router_speech_start = ctx_omni->router_units;
-                    ctx_omni->router_answering    = true;
+            const int d = router_decide(ctx_omni, params, router_event);
+            if (d >= 0) {
+                decided = true;
+                listen  = d == 0;
+                if (listen && speaking && !router_event.empty()) {
+                    router_event.pop_back();
+                    router_event += ", \"interrupted\": true}";
+                } else if (!listen) {
+                    ctx_omni->router_hold = 0;
+                    if (!speaking && ctx_omni->router_in_utt) {
+                        // The speaker went on: answer once they stop.
+                        ctx_omni->router_answer_due = true;
+                        listen = true;
+                    } else if (!speaking) {
+                        // Answer it, starting now.
+                        ctx_omni->router_open_mouth   = true;
+                        ctx_omni->router_gate_next    = false;
+                        ctx_omni->router_speech_start = ctx_omni->router_units;
+                        ctx_omni->router_answering    = true;
+                    }
                 }
             }
-        } else if (ctx_omni->router_hold > 0) {
-            ctx_omni->router_hold--;
-            listen = true;
-        } else if (ctx_omni->router_gate_next) {
-            // Would the model start speaking? (greedy: listen vs the rest,
-            // with the session's listen bias)
-            const float * logits  = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
-            const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(ctx_omni->model));
-            llama_token   best    = 0;
-            for (int v = 1; v < n_vocab; v++) {
-                if (v == ctx_omni->special_token_tts_pad) continue;
-                if (logits[v] > logits[best]) best = v;
-            }
-            const float listen_logit = logits[ctx_omni->special_token_listen]
-                                     + (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;
-            if (best != ctx_omni->special_token_listen && logits[best] > listen_logit) {
-                // Not while someone is still talking: the utterance is decided
-                // when it ends. Otherwise as the last decision says.
-                listen = ctx_omni->router_in_utt || !ctx_omni->router_utt_speak;
-                if (!listen) {
-                    ctx_omni->router_gate_next    = false;
-                    ctx_omni->router_speech_start = ctx_omni->router_units;
-                    ctx_omni->router_answering    = true;
-                    // It wanted to speak: sampling must not listen after all.
-                    ctx_omni->router_open_mouth   = true;
+        }
+        if (!decided) {
+            if (ctx_omni->router_hold > 0) {
+                ctx_omni->router_hold--;
+                listen = true;
+            } else if (ctx_omni->router_gate_next && !speaking) {
+                if (ctx_omni->router_in_utt || !ctx_omni->router_utt_speak) {
+                    // Not while someone is talking, and not unless the last
+                    // decision was to answer: listen, whatever sampling says.
+                    listen = true;
+                } else {
+                    // Would the model start speaking? (greedy: listen vs the
+                    // rest, with the session's listen bias)
+                    const float * logits  = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+                    const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(ctx_omni->model));
+                    llama_token   best    = 0;
+                    for (int v = 1; v < n_vocab; v++) {
+                        if (v == ctx_omni->special_token_tts_pad) continue;
+                        if (logits[v] > logits[best]) best = v;
+                    }
+                    const float listen_logit = logits[ctx_omni->special_token_listen]
+                                             + (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;
+                    const bool wants = best != ctx_omni->special_token_listen && logits[best] > listen_logit;
+                    if (wants || ctx_omni->router_answer_due) {
+                        ctx_omni->router_answer_due   = false;
+                        ctx_omni->router_gate_next    = false;
+                        ctx_omni->router_speech_start = ctx_omni->router_units;
+                        ctx_omni->router_answering    = true;
+                        // Sampling must not listen after all.
+                        ctx_omni->router_open_mouth   = true;
+                    }
                 }
             }
         }
         if (listen) {
-            common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
-            std::vector<llama_token> tokens = {ctx_omni->special_token_listen, ctx_omni->special_token_unit_end};
-            eval_tokens(ctx_omni, params, tokens, params->n_batch, &ctx_omni->n_past);
-            ctx_omni->slide_last_was_listen = true;
-            ctx_omni->ended_with_listen     = true;
-            ctx_omni->router_gate_next      = true;
-            if (speaking && ctx_omni->use_tts && ctx_omni->tts_thread_info) {
-                // Its speech was stopped: end the TTS turn, as a sampled
-                // listen after speech does.
-                LLMOut * llm_out = new LLMOut();
-                llm_out->n_past         = ctx_omni->n_past;
-                llm_out->llm_finish     = true;
-                llm_out->debug_dir      = debug_dir;
-                llm_out->n_embd         = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-                llm_out->is_end_of_turn = true;
-                {
-                    std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
-                    ctx_omni->tts_thread_info->cv.wait(lock, [&]{
-                        return ctx_omni->tts_thread_info->queue.size()
-                               < (size_t)ctx_omni->tts_thread_info->MAX_QUEUE_SIZE;
-                    });
-                    ctx_omni->tts_thread_info->queue.push(llm_out);
-                }
-                ctx_omni->tts_thread_info->cv.notify_all();
-            }
-            ctx_omni->router_turn_open = false;
-            if (ctx_omni->use_tts) {
-                ctx_omni->speek_done = true;
-            }
-            std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-            if (!router_event.empty()) {
-                ctx_omni->text_queue.push_back("__ROUTER__" + router_event);
-            }
-            ctx_omni->text_queue.push_back("__IS_LISTEN__");
-            ctx_omni->text_done_flag = true;
-            ctx_omni->text_streaming = false;
-            ctx_omni->text_cv.notify_all();
-            return true;
+            ctx_omni->router_close_mouth = true;
+            ctx_omni->router_open_mouth  = false;
         }
         if (!router_event.empty()) {
             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
