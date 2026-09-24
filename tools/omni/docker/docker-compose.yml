@@ -1,0 +1,46 @@
+# llama-omni-server with CUDA, built from this checkout.
+#
+#   cd tools/omni/docker
+#   docker compose build                      # CUDA_DOCKER_ARCH=86 for a 3060 only (faster)
+#   docker compose run --rm omni download     # models into ./models (add --vision for video)
+#   docker compose up -d
+#
+# The server has no authentication: the port is bound to loopback. To reach
+# it from other machines or containers, bind it elsewhere on a trusted network.
+
+x-proxy-build-args: &proxy-build-args
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-}
+  http_proxy: ${http_proxy:-}
+  https_proxy: ${https_proxy:-}
+  no_proxy: ${no_proxy:-}
+
+services:
+  omni:
+    build:
+      context: ../../..
+      dockerfile: tools/omni/docker/Dockerfile
+      args:
+        <<: *proxy-build-args
+        CUDA_DOCKER_ARCH: ${CUDA_DOCKER_ARCH:-75;80;86;89;90;120}
+    image: llama-omni-server:cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./models:/models
+      - ./cache:/cache
+    environment:
+      OMNI_CTX: ${OMNI_CTX:-8192}
+      OMNI_EXTRA_ARGS: ${OMNI_EXTRA_ARGS:-}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+    ports:
+      - "127.0.0.1:${OMNI_PORT:-19060}:19060"
+    restart: unless-stopped

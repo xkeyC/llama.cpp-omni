@@ -33,6 +33,34 @@ duplex sliding window keeps the session going past it.
 127.0.0.1, so pass `--host 0.0.0.0` for a server reached from other machines
 or containers (there is no authentication).
 
+## Docker (CUDA)
+
+`tools/omni/docker` builds `llama-omni-server` with CUDA from this checkout
+and runs it with the settings above:
+
+```bash
+cd tools/omni/docker
+docker compose build                    # CUDA_DOCKER_ARCH=86 builds for a 3060 only (faster)
+docker compose run --rm omni download   # models into ./models; --vision adds the vision encoder
+docker compose up -d                    # ws://127.0.0.1:19060/backend
+```
+
+- Needs the NVIDIA container toolkit (Docker Desktop with WSL 2 on Windows).
+  The default build covers GPU architectures 75, 80, 86, 89, 90 and 120.
+- Models live in `./models` (~9 GB: Q4_K_M LLM, audio, TTS, token2wav, the two
+  voice-clone ONNX models); `QUANT=Q8_0` picks another LLM quantization and
+  `HF_ENDPOINT` a mirror. Voice bundles are cached in `./cache`.
+- Voice cloning is set up when `models/voice-clone` is there.
+- On Windows keep the models on the WSL 2 file system or in a Docker volume:
+  a bind mount of a Windows drive loads them several times slower (~8 min).
+- `OMNI_CTX`, `OMNI_PORT` and `OMNI_EXTRA_ARGS` (more server flags) can be set
+  in the environment or a `.env` file.
+- The port is bound to loopback because the server has no authentication;
+  change the mapping in `docker-compose.yml` only on a trusted network. A bot
+  in another container reaches it without any port mapping by joining the
+  compose network: `ws://omni:19060/backend`.
+- Build arguments take `HTTP_PROXY` / `HTTPS_PROXY` from the environment.
+
 ## session.init
 
 - `vision: false` — audio-only session; the vision encoder is not loaded.

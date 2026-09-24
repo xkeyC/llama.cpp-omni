@@ -18,3 +18,7 @@ models/*
 arm_neon.h
 compile_commands.json
 Dockerfile
+
+# tools/omni/docker volumes
+tools/omni/docker/models/
+tools/omni/docker/cache/
