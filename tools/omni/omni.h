@@ -426,10 +426,12 @@ struct omni_context {
     std::string token2wav_voice;      // prompt bundle dir in use; empty = prompt_cache.gguf
 
     // Forced speech (omni_say): text tokens the duplex decode speaks verbatim,
-    // say_tokens_per_chunk per 1 s unit, in place of sampling.
+    // say_tokens_per_chunk per 1 s unit, in place of sampling (the TTS makes
+    // at most ~1 s of audio per unit: more text per unit gets cut short).
     std::mutex say_mtx;
     std::deque<llama_token> say_tokens;
-    int say_tokens_per_chunk = 8;
+    bool say_speaking = false;  // forced speech has started and not ended
+    int say_tokens_per_chunk = 4;  // ~1 s of speech: the TTS makes at most ~1 s per unit
 
     // Tool router (omni_router_configure). Every user utterance (a run of
     // voiced units) is decided by the same LLM in text mode: transcribed on
@@ -538,12 +540,14 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 // prompt_cache.gguf when bundle_dir is empty. The models stay loaded.
 bool omni_set_voice_bundle(struct omni_context * ctx_omni, const std::string & bundle_dir);
 
-// Forced speech in a duplex session: the following units speak `text`
-// verbatim (as the model's own turn: it stays in the LLM context and goes
-// through TTS with the session voice) instead of sampling, then end the turn.
+// Forced speech in a duplex session: from the next unit where the model is
+// not speaking, the units speak `text` verbatim (as the model's own turn: it
+// stays in the LLM context and goes through TTS with the session voice)
+// instead of sampling, then end the turn.
 // Special tokens in `text` are not parsed. Calls queue up.
 void omni_say(struct omni_context * ctx_omni, const std::string & text);
-// Drops forced speech not spoken yet (audio already generated still arrives).
+// Drops forced speech not spoken yet (audio already generated still arrives;
+// a forced turn already started still ends properly).
 void omni_say_cancel(struct omni_context * ctx_omni);
 
 // Tool router: enables it with `config` (see omni_context::router_config), or

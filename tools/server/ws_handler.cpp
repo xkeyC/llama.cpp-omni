@@ -194,6 +194,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->round_start_positions.clear();
     octx->force_listen_used = 0;
     omni_say_cancel(octx);
+    octx->say_speaking = false;
 
     octx->tts_all_generated_tokens.clear();
     octx->tts_token_buffer.clear();

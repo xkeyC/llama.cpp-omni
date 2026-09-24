@@ -4356,7 +4356,7 @@ void omni_say_cancel(struct omni_context * ctx_omni) {
         return;
     }
     std::lock_guard<std::mutex> lk(ctx_omni->say_mtx);
-    ctx_omni->say_tokens.clear();
+    ctx_omni->say_tokens.clear();  // a turn already started still gets its end
 }
 
 bool omni_set_voice_bundle(struct omni_context * ctx_omni, const std::string & bundle_dir) {
@@ -10199,6 +10199,7 @@ static bool duplex_do_forced_speech(omni_context * ctx_omni, common_params * par
     };
 
     eval_control(ctx_omni->special_token_speak);
+    ctx_omni->say_speaking = !last;
     std::string              text;
     std::vector<llama_token> token_ids;
     std::vector<float>       hidden;
@@ -10350,20 +10351,25 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     }
 
     // ---- forced speech (omni_say) takes this unit instead of sampling ----
+    // It starts between turns only (spliced into the model's own speech, the
+    // TTS garbles both), then runs unit after unit; a last unit without text
+    // ends the turn.
     {
         std::vector<llama_token> say_chunk;
-        bool say_last = false;
+        bool take = false;
         {
             std::lock_guard<std::mutex> lk(ctx_omni->say_mtx);
-            const size_t n = (size_t) std::max(1, ctx_omni->say_tokens_per_chunk);
-            while (!ctx_omni->say_tokens.empty() && say_chunk.size() < n) {
-                say_chunk.push_back(ctx_omni->say_tokens.front());
-                ctx_omni->say_tokens.pop_front();
+            if (ctx_omni->say_speaking || (!ctx_omni->say_tokens.empty() && ctx_omni->slide_last_was_listen)) {
+                take = true;
+                const size_t n = (size_t) std::max(1, ctx_omni->say_tokens_per_chunk);
+                while (!ctx_omni->say_tokens.empty() && say_chunk.size() < n) {
+                    say_chunk.push_back(ctx_omni->say_tokens.front());
+                    ctx_omni->say_tokens.pop_front();
+                }
             }
-            say_last = !say_chunk.empty() && ctx_omni->say_tokens.empty();
         }
-        if (!say_chunk.empty()) {
-            return duplex_do_forced_speech(ctx_omni, params, debug_dir, say_chunk, say_last);
+        if (take) {
+            return duplex_do_forced_speech(ctx_omni, params, debug_dir, say_chunk, say_chunk.empty());
         }
     }
 
@@ -10376,19 +10382,15 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             listen = true;
         } else if (ctx_omni->router_need_route) {
             // An utterance just ended: decide it, whatever the model is doing.
-            // If it says the model is not to answer, speech the model started
-            // before the utterance (answering something else) goes on;
-            // speech it started since (answering this) is stopped.
-            const bool speaking = !ctx_omni->slide_last_was_listen;
+            // The model keeps talking into what it hears next, so a decision
+            // against speaking also stops its own speech (forced speech is
+            // spoken whole before any decision); the client decides what to
+            // do with the audio already generated.
+            const bool speaking = !ctx_omni->slide_last_was_listen && ctx_omni->router_speech_start != 0;
             listen = !router_decide(ctx_omni, params, router_event);
-            if (listen && speaking) {
-                if (ctx_omni->router_speech_start >= 0 && ctx_omni->router_speech_start < ctx_omni->router_utt_start) {
-                    listen = false;
-                    ctx_omni->router_hold = 0;
-                } else if (!router_event.empty()) {
-                    router_event.pop_back();
-                    router_event += ", \"interrupted\": true}";
-                }
+            if (listen && speaking && !router_event.empty()) {
+                router_event.pop_back();
+                router_event += ", \"interrupted\": true}";
             }
         } else if (ctx_omni->router_gate_next) {
             // Would the model start speaking? (greedy: listen vs the rest,
