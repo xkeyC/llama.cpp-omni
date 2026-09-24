@@ -21,6 +21,8 @@ services:
     build:
       context: ../../..
       dockerfile: tools/omni/docker/Dockerfile
+      # Host network: a proxy on the host's loopback (HTTP_PROXY) works for the build.
+      network: host
       args:
         <<: *proxy-build-args
         CUDA_DOCKER_ARCH: ${CUDA_DOCKER_ARCH:-75;80;86;89;90;120}
