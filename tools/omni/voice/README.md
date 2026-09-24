@@ -100,6 +100,7 @@ Every `session.init` configures the router anew (none without `config.router`). 
   client typically runs the task and sends the result as `say`.
 
 The model does not start speaking while an utterance is going on, and after
-answering and yielding it waits for the next utterance (left alone it keeps
-greeting and repeats itself). `interrupted` says the decision stopped the
+answering and yielding it waits for the next utterance: left alone it keeps
+greeting and repeats itself. (A `reply` decided while it was already
+speaking still allows one turn after it yields.) `interrupted` says the decision stopped the
 model's own speech.
