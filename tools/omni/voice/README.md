@@ -29,7 +29,9 @@ Keep `-c` at 8192: that is the context the model was trained on; beyond it
 answers degrade (it stops answering after ~8K tokens in long sessions). The
 duplex sliding window keeps the session going past it.
 
-`--host` is honoured now (upstream always bound 0.0.0.0).
+`--host` is honoured now (upstream always bound 0.0.0.0): the default is
+127.0.0.1, so pass `--host 0.0.0.0` for a server reached from other machines
+or containers (there is no authentication).
 
 ## session.init
 
@@ -41,7 +43,9 @@ duplex sliding window keeps the session going past it.
   (`make_voice_bundle.py <wav> <out_dir>`, needs `campplus.onnx` and
   `speech_tokenizer_v2_25hz.onnx` from the MiniCPM-o 4.5 repo) and cached in
   `OMNI_VOICE_CACHE_DIR` (default `<temp>/omni_ws/voices`). Without reference
-  audio the default voice is restored. The models stay loaded.
+  audio the default voice is restored. The models stay loaded. Without
+  `OMNI_VOICE_BUNDLE_CMD` the reference audio only styles the LLM prompt, as
+  upstream, and token2wav keeps its default voice.
 - `config.say_tokens_per_chunk` — forced speech rate (default 4 tokens per
   unit, about 1 s of speech; the TTS makes at most ~1 s of audio per unit).
 - `config.router` — the tool router (below).
@@ -72,12 +76,17 @@ tools prompt (sequence 1, system prompt cached):
   "bias": {"silence": 4.0},
   "user_template": "{heard}",
   "transcribe_prompt": "请仔细听这段音频片段，并将其内容逐字记录。",
-  "audio_units": 12, "silence_hold": 1, "tool_hold": 3
+  "audio_units": 12, "silence_hold": 1, "tool_hold": 3,
+  "client_transcripts": true
 }
 ```
 
 The tool name is chosen greedily among the configured names (with the logit
-bias); arguments are generated for other tools. Decisions come back as
+bias); arguments are generated for other tools. With `client_transcripts`, an
+utterance ends when its transcript arrives (not when the client marks the
+voice as over), so each utterance is decided once. The tools prompt must fit
+`OMNI_ROUTER_CTX` with ~1024 tokens to spare, or the router turns itself off.
+Every `session.init` configures the router anew (none without `config.router`). Decisions come back as
 
 ```json
 {"type": "response.tool_call", "name": "backend_task", "arguments": {"task": "..."},

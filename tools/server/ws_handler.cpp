@@ -234,6 +234,48 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
 // Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
 // context and params. Unknown/missing keys are left at model defaults.
 static void apply_session_config(common_params & params, omni_context * octx, const ParsedSessionInit & init) {
+    // Session-scoped settings: a reused context must not keep the previous
+    // session's (tool router, forced speech rate).
+    octx->say_tokens_per_chunk = 4;
+    {
+        omni_context::router_config rc;
+        if (init.config.is_object() && init.config.contains("router") && init.config.at("router").is_object()) {
+            try {
+                const json & r = init.config.at("router");
+                rc.system             = r.value("system", std::string());
+                rc.user_template      = r.value("user_template", std::string());
+                rc.transcribe_prompt  = r.value("transcribe_prompt",
+                    std::string("Please listen to the audio snippet carefully and transcribe the content."));
+                rc.voice_rms          = r.value("voice_rms", rc.voice_rms);
+                rc.audio_units        = r.value("audio_units", rc.audio_units);
+                rc.silence_hold       = r.value("silence_hold", rc.silence_hold);
+                rc.tool_hold          = r.value("tool_hold", rc.tool_hold);
+                rc.client_transcripts = r.value("client_transcripts", rc.client_transcripts);
+                if (r.contains("reasoning") && r.at("reasoning").is_array()) {
+                    for (const auto & t : r.at("reasoning")) {
+                        if (t.is_string()) rc.reasoning.push_back(t.get<std::string>());
+                    }
+                }
+                if (r.contains("tools") && r.at("tools").is_array()) {
+                    for (const auto & t : r.at("tools")) {
+                        if (t.is_string()) rc.tools.push_back(t.get<std::string>());
+                    }
+                }
+                for (const auto & t : rc.tools) {
+                    float b = 0.0f;
+                    if (r.contains("bias") && r.at("bias").is_object() && r.at("bias").contains(t)
+                        && r.at("bias").at(t).is_number()) {
+                        b = r.at("bias").at(t).get<float>();
+                    }
+                    rc.bias.push_back(b);
+                }
+            } catch (const std::exception & e) {
+                LOG_WRN("config.router ignored: %s\n", e.what());
+                rc = omni_context::router_config();
+            }
+        }
+        omni_router_configure(octx, rc);
+    }
     if (!init.config.is_object()) {
         return;
     }
@@ -249,38 +291,6 @@ static void apply_session_config(common_params & params, omni_context * octx, co
     }
     if (init.config.contains("max_new_speak_tokens_per_chunk") && init.config.at("max_new_speak_tokens_per_chunk").is_number_integer()) {
         octx->max_new_speak_tokens_per_chunk = init.config.at("max_new_speak_tokens_per_chunk").get<int>();
-    }
-    // Tool router (config.router): see omni_context::router_config.
-    {
-        omni_context::router_config rc;
-        if (init.config.contains("router") && init.config.at("router").is_object()) {
-            const json & r = init.config.at("router");
-            rc.system          = r.value("system", std::string());
-            rc.user_template     = r.value("user_template", std::string());
-            rc.transcribe_prompt = r.value("transcribe_prompt", std::string("Please listen to the audio snippet carefully and transcribe the content."));
-            rc.voice_rms         = r.value("voice_rms", rc.voice_rms);
-            rc.audio_units     = r.value("audio_units", rc.audio_units);
-            rc.silence_hold    = r.value("silence_hold", rc.silence_hold);
-            rc.tool_hold       = r.value("tool_hold", rc.tool_hold);
-            if (r.contains("reasoning") && r.at("reasoning").is_array()) {
-                for (const auto & t : r.at("reasoning")) {
-                    if (t.is_string()) rc.reasoning.push_back(t.get<std::string>());
-                }
-            }
-            if (r.contains("tools") && r.at("tools").is_array()) {
-                for (const auto & t : r.at("tools")) {
-                    if (t.is_string()) rc.tools.push_back(t.get<std::string>());
-                }
-            }
-            for (const auto & t : rc.tools) {
-                float b = 0.0f;
-                if (r.contains("bias") && r.at("bias").is_object() && r.at("bias").contains(t)) {
-                    b = r.at("bias").at(t).get<float>();
-                }
-                rc.bias.push_back(b);
-            }
-        }
-        omni_router_configure(octx, rc);
     }
     if (init.config.contains("say_tokens_per_chunk") && init.config.at("say_tokens_per_chunk").is_number_integer()) {
         octx->say_tokens_per_chunk = init.config.at("say_tokens_per_chunk").get<int>();
@@ -583,8 +593,11 @@ static bool apply_session_voice(omni_context * octx, const std::string & ref_aud
     if (!cached) {
         const char * cmd = getenv("OMNI_VOICE_BUNDLE_CMD");
         if (!cmd || !*cmd) {
-            error = "voice cloning needs OMNI_VOICE_BUNDLE_CMD";
-            return false;
+            // Not set up for voice cloning: the reference audio still styles
+            // the LLM prompt (as upstream), token2wav keeps its default voice.
+            LOG_WRN("voice clone: OMNI_VOICE_BUNDLE_CMD not set; token2wav keeps the default voice\n");
+            omni_set_voice_bundle(octx, "");
+            return true;
         }
         std::error_code ec;
         fs::create_directories(dir, ec);
@@ -607,6 +620,9 @@ static bool apply_session_voice(omni_context * octx, const std::string & ref_aud
         }
     }
     if (!omni_set_voice_bundle(octx, dir.string())) {
+        // Built again next time rather than failing for good.
+        std::error_code ec;
+        fs::remove_all(dir, ec);
         error = "voice bundle rejected by token2wav";
         return false;
     }
@@ -1315,22 +1331,39 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                  turn_vision_slices)));
                         break; // Done for this input
                     } else if (frag.rfind("__ROUTER__", 0) == 0) {
-                        // Tool router decision: {"name": ..., "arguments": ...}
+                        // Tool router decision: {"name", "call", "heard"[, "interrupted"]}
                         json ev;
                         ev["type"] = "response.tool_call";
                         ev["session_id"] = session_id;
                         ev["response_id"] = response_id;
-                        const std::string raw = frag.substr(10);
+                        ev["arguments"] = json::object();
                         try {
-                            const json call = json::parse(raw);
-                            ev["name"] = call.value("name", std::string());
-                            ev["arguments"] = call.contains("arguments") ? call.at("arguments") : json::object();
-                            ev["heard"] = call.value("heard", std::string());
-                        } catch (const std::exception &) {
+                            const json decision = json::parse(frag.substr(10));
+                            ev["name"] = decision.value("name", std::string());
+                            ev["heard"] = decision.value("heard", std::string());
+                            if (decision.value("interrupted", false)) {
+                                ev["interrupted"] = true;
+                            }
+                            // The generated call may be cut short: parse what is there.
+                            const std::string call = decision.value("call", std::string());
+                            for (const std::string & tail : {std::string(), std::string("}"), std::string("}}"),
+                                                             std::string("\"}}")}) {
+                                const json parsed = json::parse(call + tail, nullptr, false);
+                                if (!parsed.is_discarded()) {
+                                    if (parsed.is_object() && parsed.contains("arguments")) {
+                                        ev["arguments"] = parsed.at("arguments");
+                                    }
+                                    break;
+                                }
+                            }
+                            if (ev["arguments"].empty() && call.find("\"arguments\"") != std::string::npos) {
+                                ev["raw"] = call;
+                            }
+                        } catch (const std::exception & e) {
+                            LOG_WRN("WS /backend: bad router event: %s\n", e.what());
                             ev["name"] = "";
-                            ev["raw"] = raw;
                         }
-                        send_event(ev);
+                        ws.send(ev.dump(-1, ' ', false, json::error_handler_t::replace));
                     } else if (frag == "__END_OF_TURN__") {
                         // Turn ended — will be handled by response.done
                     } else {

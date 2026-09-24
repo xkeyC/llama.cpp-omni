@@ -454,6 +454,7 @@ struct omni_context {
         int                      silence_hold = 1;   // units kept listening after "silence"
         int                      tool_hold    = 3;   // units kept listening after another tool
         float                    voice_rms    = 0.01f;  // a unit is voiced above this RMS (unless the client says)
+        bool                     client_transcripts = false;  // utterances end with client transcripts only
     };
     router_config router;
     bool router_enabled = false;
@@ -472,6 +473,7 @@ struct omni_context {
     long router_utt_start   = 0;      // unit the current / last utterance started at
     long router_speech_start = -1;    // unit the model's current speech started at
     bool router_answering   = false;  // the model spoke since the last decision to speak
+    bool router_turn_open   = false;  // the model's own speech is going on (no turn end yet)
     bool router_open_mouth  = false;  // the next sample may not listen or end: answer now
     bool router_gate_next   = true;   // the next speech onset is checked
     int  router_prefix_len  = 0;      // system prompt cached on sequence 1
