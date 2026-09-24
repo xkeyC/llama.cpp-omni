@@ -423,6 +423,55 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    std::string token2wav_voice;      // prompt bundle dir in use; empty = prompt_cache.gguf
+
+    // Forced speech (omni_say): text tokens the duplex decode speaks verbatim,
+    // say_tokens_per_chunk per 1 s unit, in place of sampling.
+    std::mutex say_mtx;
+    std::deque<llama_token> say_tokens;
+    int say_tokens_per_chunk = 8;
+
+    // Tool router (omni_router_configure). Every user utterance (a run of
+    // voiced units) is decided by the same LLM in text mode: transcribed on
+    // sequence 2, then a tool is chosen for the transcript with the configured
+    // tools prompt on sequence 1 (system prompt cached). "reply" lets the
+    // duplex model answer as it likes; "silence" keeps it listening (and stops
+    // it if it is speaking); any other tool is reported to the client as a
+    // response.tool_call event and keeps it listening. The model does not
+    // start speaking while an utterance is going on. A client with its own
+    // VAD/ASR can mark utterances (voiced) and end them with a transcript,
+    // which then replaces the transcription. Needs OMNI_ROUTER_CTX.
+    struct router_config {
+        std::string              system;             // tools prompt (system turn)
+        std::string              user_template;      // user turn: {heard} transcript, {recent} model's recent speech
+        std::string              transcribe_prompt;  // instruction after the audio when transcribing
+        std::vector<std::string> tools;              // tool names to choose from
+        std::vector<float>       bias;               // logit bias per tool (same order)
+        std::vector<std::string> reasoning;          // lines started in <think>, each completed by the model
+        int                      audio_units  = 12;  // longest utterance audio transcribed (s)
+        int                      silence_hold = 1;   // units kept listening after "silence"
+        int                      tool_hold    = 3;   // units kept listening after another tool
+        float                    voice_rms    = 0.01f;  // a unit is voiced above this RMS (unless the client says)
+    };
+    router_config router;
+    bool router_enabled = false;
+    std::deque<std::vector<float>> router_utt_audio;  // audio of the current / last utterance
+    bool router_unit_voiced = false;  // the unit being prefilled has speech (set by the server)
+    bool router_unit_ends   = false;  // the client ends an utterance with this unit ...
+    std::string router_unit_transcript;  // ... and says what it was (see input.append.transcript)
+    bool router_has_transcript = false;  // router_transcript holds the utterance to decide
+    std::string router_transcript;
+    bool router_in_utt      = false;  // inside a voiced run
+    bool router_utt_decided = true;   // the current / last utterance has a decision
+    bool router_utt_speak   = false;  // ... and it lets the model speak
+    bool router_need_route  = false;  // an utterance ended undecided
+    int  router_hold        = 0;      // units still kept listening
+    long router_units       = 0;      // units seen
+    long router_utt_start   = 0;      // unit the current / last utterance started at
+    long router_speech_start = -1;    // unit the model's current speech started at
+    bool router_gate_next   = true;   // the next speech onset is checked
+    int  router_prefix_len  = 0;      // system prompt cached on sequence 1
+    std::string router_recent;        // what the model said lately
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
@@ -484,6 +533,23 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 //
 // omni main
 //
+// Voice clone: make token2wav speak with the voice of a prompt bundle
+// (tools/omni/voice/make_voice_bundle.py), or with the default voice of
+// prompt_cache.gguf when bundle_dir is empty. The models stay loaded.
+bool omni_set_voice_bundle(struct omni_context * ctx_omni, const std::string & bundle_dir);
+
+// Forced speech in a duplex session: the following units speak `text`
+// verbatim (as the model's own turn: it stays in the LLM context and goes
+// through TTS with the session voice) instead of sampling, then end the turn.
+// Special tokens in `text` are not parsed. Calls queue up.
+void omni_say(struct omni_context * ctx_omni, const std::string & text);
+// Drops forced speech not spoken yet (audio already generated still arrives).
+void omni_say_cancel(struct omni_context * ctx_omni);
+
+// Tool router: enables it with `config` (see omni_context::router_config), or
+// disables it when config.tools is empty. Call between sessions.
+void omni_router_configure(struct omni_context * ctx_omni, const omni_context::router_config & config);
+
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
                                 bool duplex_mode = false,

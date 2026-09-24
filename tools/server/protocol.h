@@ -92,6 +92,9 @@ struct ParsedSessionInit {
 
     std::string system_prompt;
 
+    // false: audio-only session; the vision encoder is not loaded
+    bool vision = true;
+
     // opaque pass-through config (sampling params)
     json config;
 };
@@ -105,6 +108,11 @@ struct ParsedInput {
     std::vector<std::string> video_frames_b64;     // base64 JPEG frames
     int max_slice_nums = -1;
     bool force_listen = false;            // full_duplex: force this step to LISTEN
+    std::string say;                      // full_duplex: text to speak verbatim (omni_say)
+    bool say_cancel = false;              // full_duplex: drop forced speech not spoken yet
+    int voiced = -1;                      // full_duplex: 1/0 = the client says whether the unit has speech
+    bool has_transcript = false;          // full_duplex: the client ends an utterance with this unit
+    std::string transcript;               // ... and this is what was said (tool router)
 
     // Turn-based fields
     bool streaming = true;

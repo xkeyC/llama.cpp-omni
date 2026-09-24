@@ -293,6 +293,13 @@ ParsedSessionInit parse_session_init(const json & msg) {
 
     // system_prompt
     out.system_prompt = json_str(p, "system_prompt");
+    // Full duplex: plain-text instructions go after the reference audio, inside
+    // the system turn; a prompt starting with a special token is used verbatim.
+    if (out.mode == "full_duplex" && !out.system_prompt.empty() && out.system_prompt.rfind("<|", 0) != 0) {
+        out.system_prompt = "<|audio_end|>" + out.system_prompt + "<|im_end|>\n";
+    }
+
+    out.vision = json_bool(p, "vision", true);
 
     // config (opaque pass-through)
     if (p.contains("config") && p.at("config").is_object()) {
@@ -370,6 +377,15 @@ ParsedInput parse_input_append(const json & msg) {
     }
 
     out.force_listen = json_bool(in, "force_listen", false);
+    out.say = json_str(in, "say");
+    out.say_cancel = json_bool(in, "say_cancel", false);
+    if (in.contains("transcript") && in.at("transcript").is_string()) {
+        out.has_transcript = true;
+        out.transcript = in.at("transcript").get<std::string>();
+    }
+    if (in.contains("voiced") && in.at("voiced").is_boolean()) {
+        out.voiced = in.at("voiced").get<bool>() ? 1 : 0;
+    }
     if (in.contains("hints") && in.at("hints").is_object()) {
         out.force_listen = json_bool(in.at("hints"), "force_listen", out.force_listen);
     }

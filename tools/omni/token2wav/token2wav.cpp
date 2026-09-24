@@ -179,6 +179,22 @@ bool Token2WavSession::feed_tokens(const int32_t *              tokens,
     return true;
 }
 
+bool Token2WavSession::set_prompt_bundle(const std::string & prompt_bundle_dir, int n_timesteps,
+                                         float temperature) {
+    Token2Mel::PromptBundle pb;
+    if (!Token2Mel::load_prompt_bundle_dir(prompt_bundle_dir, pb)) {
+        return false;
+    }
+    pending_.clear();
+    return t2w.start_stream_with_prompt(pb, n_timesteps, temperature);
+}
+
+bool Token2WavSession::set_prompt_cache_gguf(const std::string & prompt_cache_gguf_path, int n_timesteps,
+                                             float temperature) {
+    pending_.clear();
+    return t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature);
+}
+
 void Token2WavSession::reset() {
     // 清空 pending，并重置内部流式状态
     pending_.clear();

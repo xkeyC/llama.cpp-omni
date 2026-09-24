@@ -411,7 +411,8 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    LOG_INF("listening on %s:%d\n", params.hostname.c_str(), params.port);
+    svr.listen(params.hostname, params.port);
 
     // cleanup
     {

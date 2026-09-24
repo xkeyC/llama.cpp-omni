@@ -193,6 +193,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->wav_turn_base = 0;
     octx->round_start_positions.clear();
     octx->force_listen_used = 0;
+    omni_say_cancel(octx);
 
     octx->tts_all_generated_tokens.clear();
     octx->tts_token_buffer.clear();
@@ -225,6 +226,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
 
     if (!init.system_prompt.empty()) {
         octx->omni_assistant_prompt = init.system_prompt;
+        octx->audio_assistant_prompt = init.system_prompt;
     }
 }
 
@@ -246,6 +248,41 @@ static void apply_session_config(common_params & params, omni_context * octx, co
     }
     if (init.config.contains("max_new_speak_tokens_per_chunk") && init.config.at("max_new_speak_tokens_per_chunk").is_number_integer()) {
         octx->max_new_speak_tokens_per_chunk = init.config.at("max_new_speak_tokens_per_chunk").get<int>();
+    }
+    // Tool router (config.router): see omni_context::router_config.
+    {
+        omni_context::router_config rc;
+        if (init.config.contains("router") && init.config.at("router").is_object()) {
+            const json & r = init.config.at("router");
+            rc.system          = r.value("system", std::string());
+            rc.user_template     = r.value("user_template", std::string());
+            rc.transcribe_prompt = r.value("transcribe_prompt", std::string("Please listen to the audio snippet carefully and transcribe the content."));
+            rc.voice_rms         = r.value("voice_rms", rc.voice_rms);
+            rc.audio_units     = r.value("audio_units", rc.audio_units);
+            rc.silence_hold    = r.value("silence_hold", rc.silence_hold);
+            rc.tool_hold       = r.value("tool_hold", rc.tool_hold);
+            if (r.contains("reasoning") && r.at("reasoning").is_array()) {
+                for (const auto & t : r.at("reasoning")) {
+                    if (t.is_string()) rc.reasoning.push_back(t.get<std::string>());
+                }
+            }
+            if (r.contains("tools") && r.at("tools").is_array()) {
+                for (const auto & t : r.at("tools")) {
+                    if (t.is_string()) rc.tools.push_back(t.get<std::string>());
+                }
+            }
+            for (const auto & t : rc.tools) {
+                float b = 0.0f;
+                if (r.contains("bias") && r.at("bias").is_object() && r.at("bias").contains(t)) {
+                    b = r.at("bias").at(t).get<float>();
+                }
+                rc.bias.push_back(b);
+            }
+        }
+        omni_router_configure(octx, rc);
+    }
+    if (init.config.contains("say_tokens_per_chunk") && init.config.at("say_tokens_per_chunk").is_number_integer()) {
+        octx->say_tokens_per_chunk = init.config.at("say_tokens_per_chunk").get<int>();
     }
     if (init.config.contains("tts_temperature") && init.config.at("tts_temperature").is_number()) {
         octx->tts_temperature = init.config.at("tts_temperature").get<float>();
@@ -514,6 +551,68 @@ static void configure_turn_based_prompt(omni_context * octx,
 }
 
 // ============================================================================
+// Voice clone
+// ============================================================================
+
+// Points token2wav at the voice of the session's reference audio: a prompt
+// bundle cached under OMNI_VOICE_CACHE_DIR (default <temp>/voices) by a hash
+// of the audio, built on first use by OMNI_VOICE_BUNDLE_CMD, a command taking
+// "<ref.wav> <out_dir>" (tools/omni/voice/make_voice_bundle.py). Without
+// reference audio the default voice is restored. Returns false (with error)
+// if the voice cannot be set.
+static bool apply_session_voice(omni_context * octx, const std::string & ref_audio_b64,
+                                const std::string & temp_dir, std::string & error) {
+    if (!octx->token2wav_initialized) {
+        return true;  // no C++ token2wav: nothing to switch
+    }
+    if (ref_audio_b64.empty()) {
+        if (!omni_set_voice_bundle(octx, "")) {
+            error = "default voice restore failed";
+            return false;
+        }
+        return true;
+    }
+    const char * cache_env = getenv("OMNI_VOICE_CACHE_DIR");
+    const fs::path cache_root = cache_env && *cache_env ? fs::path(cache_env) : fs::path(temp_dir) / "voices";
+    char key[40];
+    snprintf(key, sizeof(key), "%016zx-%zu", std::hash<std::string>{}(ref_audio_b64), ref_audio_b64.size());
+    const fs::path dir = cache_root / key;
+    const bool cached = fs::exists(dir / "spk_f32.bin") && fs::exists(dir / "prompt_tokens_i32.bin") &&
+                        fs::exists(dir / "prompt_mel_btc_f32.bin");
+    if (!cached) {
+        const char * cmd = getenv("OMNI_VOICE_BUNDLE_CMD");
+        if (!cmd || !*cmd) {
+            error = "voice cloning needs OMNI_VOICE_BUNDLE_CMD";
+            return false;
+        }
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const std::string wav = TempMediaFiles::write_audio_wav(ref_audio_b64, dir.string(), 0);
+        if (wav.empty()) {
+            error = "reference audio decode failed";
+            return false;
+        }
+        std::string command = std::string(cmd) + " \"" + wav + "\" \"" + dir.string() + "\"";
+#ifdef _WIN32
+        // cmd.exe /c strips one pair of outer quotes.
+        command = "\"" + command + "\"";
+#endif
+        LOG_INF("voice clone: building prompt bundle: %s\n", command.c_str());
+        const int rc = std::system(command.c_str());
+        fs::remove(wav, ec);
+        if (rc != 0) {
+            error = "voice bundle command failed (" + std::to_string(rc) + ")";
+            return false;
+        }
+    }
+    if (!omni_set_voice_bundle(octx, dir.string())) {
+        error = "voice bundle rejected by token2wav";
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
 // Session-level omni init helper
 // ============================================================================
 
@@ -521,7 +620,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
                                           llama_model * model, llama_context * ctx,
                                           omni_context *& shared_octx,
                                           const std::string & output_dir) {
-    int media_type = 2; // omni
+    int media_type = init.vision ? 2 : 1; // omni, or audio only
     bool duplex_mode = (init.mode == "full_duplex");
     bool use_tts = init.use_tts;
 
@@ -532,7 +631,8 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
 
     // Reuse the server-owned context if it matches this session's mode (avoids
     // reloading the model); otherwise tear it down and build a fresh one.
-    if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
+    if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts &&
+        shared_octx->media_type == media_type) {
         reset_octx_for_session(shared_octx, init, output_dir);
         apply_session_config(p, shared_octx, init);
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
@@ -545,8 +645,10 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
         shared_octx = nullptr;
     }
 
+    // OMNI_T2W_DEVICE ("cpu", "gpu:1", ...) moves token2wav off the default GPU.
+    const char * t2w_device = getenv("OMNI_T2W_DEVICE");
     omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
-                                     /*token2wav_device*/"gpu:0", duplex_mode,
+                                     /*token2wav_device*/t2w_device && *t2w_device ? t2w_device : "gpu:0", duplex_mode,
                                      model, ctx, output_dir);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
@@ -560,6 +662,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     // Voice clone / system prompt
     if (!init.system_prompt.empty()) {
         octx->omni_assistant_prompt = init.system_prompt;
+        octx->audio_assistant_prompt = init.system_prompt;
     }
     shared_octx = octx;
 
@@ -651,6 +754,15 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     if (!octx) {
         fail_fast(session_id, "omni_init_failed");
         return;
+    }
+    {
+        std::string voice_error;
+        std::lock_guard<std::mutex> lock(octx_mutex);
+        if (!apply_session_voice(octx, parsed_init.tts_ref_audio_b64, temp_dir, voice_error)) {
+            LOG_ERR("WS /backend: voice clone failed: %s\n", voice_error.c_str());
+            fail_fast(session_id, "voice_clone_failed");
+            return;
+        }
     }
 
     // Full-duplex requires index=0 prefill before the first frame. This
@@ -1087,6 +1199,30 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             double prefill_ms = 0.0;
             int turn_vision_slices = parsed_input.video_frames_b64.empty() ? 0 : 1;
 
+            // Tool router: whether this unit has speech. The LLM thread reads
+            // it while taking this unit's prefill, before the next input.
+            if (octx->router_enabled) {
+                octx->router_unit_ends = parsed_input.has_transcript;
+                octx->router_unit_transcript = parsed_input.transcript;
+                if (parsed_input.voiced >= 0) {
+                    octx->router_unit_voiced = parsed_input.voiced == 1;
+                } else {
+                    const auto pcm = b64_to_float32_pcm(parsed_input.audio_b64);
+                    double sum = 0.0;
+                    for (const float v : pcm) sum += (double) v * v;
+                    octx->router_unit_voiced =
+                        !pcm.empty() && std::sqrt(sum / pcm.size()) > octx->router.voice_rms;
+                }
+            }
+
+            // Forced speech takes effect from this unit's decode on.
+            if (parsed_input.say_cancel) {
+                omni_say_cancel(octx);
+            }
+            if (!parsed_input.say.empty()) {
+                omni_say(octx, parsed_input.say);
+            }
+
             // Write audio to temp WAV
             if (!parsed_input.audio_b64.empty()) {
                 tmp_files.audio_path = TempMediaFiles::write_audio_wav(
@@ -1177,6 +1313,23 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                  elapsed_ms(t_request_start), 0,
                                                  turn_vision_slices)));
                         break; // Done for this input
+                    } else if (frag.rfind("__ROUTER__", 0) == 0) {
+                        // Tool router decision: {"name": ..., "arguments": ...}
+                        json ev;
+                        ev["type"] = "response.tool_call";
+                        ev["session_id"] = session_id;
+                        ev["response_id"] = response_id;
+                        const std::string raw = frag.substr(10);
+                        try {
+                            const json call = json::parse(raw);
+                            ev["name"] = call.value("name", std::string());
+                            ev["arguments"] = call.contains("arguments") ? call.at("arguments") : json::object();
+                            ev["heard"] = call.value("heard", std::string());
+                        } catch (const std::exception &) {
+                            ev["name"] = "";
+                            ev["raw"] = raw;
+                        }
+                        send_event(ev);
                     } else if (frag == "__END_OF_TURN__") {
                         // Turn ended — will be handled by response.done
                     } else {
